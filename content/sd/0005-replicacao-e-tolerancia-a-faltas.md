@@ -596,6 +596,114 @@ Para propagar as modificações:
   Quando um gestor de réplicas descobre que precisa de uma certa atualização para
   processar um pedido, este pode pedi-la diretamente.
 
+:::details[Pseudocódigo]
+
+Envio de pedido de **leitura** (_query_) do cliente para a réplica:
+
+```php
+On sending of Query request q from p_i
+  q.prev := p_i.prev;
+  send q to replica;
+  wait for reply new;
+  merge(p_i.prev, new.ts); // update client's timestamp with latest seen
+
+On receipt of Query request q from p_j at replica r_i
+  if (q.prev <= r_i.valueTS) then   // check if replica is up-to-date
+    apply_query();
+  else
+    while (q.prev > r_i.valueTS) do // wait for missing updates
+      wait for gossip;
+    end while;
+    apply_query();
+  end if
+
+Procedure apply_query()
+  new.value := r_i.value;
+  new.ts := r_i.valueTS;
+  send new to p_j;         // send response to the client
+```
+
+Envio de pedido de **modificação** (_update_) do cliente para a réplica:
+
+```php
+On sending of Update request u from p_i
+  u.id := get_unique_id();
+  u.op := <operation>;  // define the specific update e.g. PUT(key,value)
+  u.prev := p_i.prev;
+  send u to replica;
+  wait for reply new;
+  merge(p_i.prev, new); // update client's timestamp with latest seen
+
+On receipt of Update request u from p_j at replica r_i
+  if (already_processed(u.id)) then
+    return;
+  end if
+
+  r_i.replicaTS[i] := r_i.replicaTS[i] + 1;
+  new := u.prev;
+  new[i] := r_i.replicaTS[i];
+  record := <i, new, u.op, u.prev, u.id>;
+  r_i.update_log.add(record);
+  send new to p_j; // send updated timestamp back to client
+
+  if (u.prev <= r_i.valueTS) then   // check if replica is up-to-date
+    apply_update();
+  else
+    while (u.prev > r_i.valueTS) do // wait for missing updates
+      wait for gossip;
+    end while;
+    apply_update();
+  end if
+
+Procedure apply_update()
+  apply u.op to r_i.value;
+  merge(r_i.valueTS, r_i.replicaTS); // update valueTS to reflect update
+  r_i.executed_log.add(u.id);        // mark this update as executed
+```
+
+Troca de mensagens de **gossip** entre réplicas:
+
+```php
+On sending of gossip message g from replica r_i
+  g.log := r_i.update_log; // full log or estimate of unseen entries
+  g.ts := r_i.replicaTS;
+  send g to replica; // send gossip to another replica
+
+On receipt of gossip message g at replica r_i
+  new_updates := {};
+  // the replica will merge the arriving log with its own local log
+  // as it may contain updates not seen
+  for each record in g.log do
+    if (record.ts > r_i.replicaTS) then
+      r_i.update_log.add(record);
+      new_updates := new_updates U {record};
+    end if
+  end for
+  merge(r_i.replicaTS, g.ts); // update replica's timestamp with latest
+
+  if (new_updates != {}) then
+    // ensure causal order before applying updates
+    sort new_updates according to <= between vector timestamps;
+    for each record in new_updates do
+      apply record.op to r_i.value;
+      merge(r_i.valueTS, record.ts);  // update valueTS to reflect update
+      r_i.executed_log.add(record.id);// mark this update as executed
+    end for
+  end if
+  notify of this gossip;
+```
+
+Operação de **merge** entre _vector timestamps_:
+
+```php
+Procedure merge(currentTS, targetTS)
+  for i := 1 to N do
+    currentTS[i] := max{currentTS[i], targetTS[i]};
+  end for
+```
+
+:::
+
 :::warning[_Aconteceu-antes_ vs protocolo _gossip_]
 
 Enquanto que quando estudámos a relação [_aconteceu-antes_
